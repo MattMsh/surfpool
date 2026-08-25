@@ -5663,6 +5663,131 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn bundle_transaction_indices_rebase_against_live_queue_on_commit() {
+        use std::time::Duration;
+
+        use crossbeam_channel::{RecvTimeoutError, unbounded};
+        use solana_keypair::Keypair;
+        use solana_message::{Message, VersionedMessage};
+        use solana_signer::Signer;
+        use solana_system_interface::instruction as system_instruction;
+        use solana_transaction::versioned::VersionedTransaction;
+
+        use crate::surfnet::svm::BundleSandbox;
+
+        let (svm, _events_rx, geyser_rx) = SurfnetSvm::default();
+        let live_locker = SurfnetSvmLocker::new(svm);
+        let bundle_payer = Keypair::new();
+        let live_payer = Keypair::new();
+
+        for payer in [&bundle_payer, &live_payer] {
+            let _ = live_locker
+                .airdrop(&payer.pubkey(), 1_000_000_000)
+                .expect("airdrop should succeed");
+        }
+
+        let bundle_sandbox = live_locker.with_svm_reader(|svm| svm.clone_for_bundle_sandbox());
+        let BundleSandbox {
+            svm: sandbox_svm,
+            geyser_rx: sandbox_geyser_rx,
+            simnet_rx: sandbox_simnet_rx,
+            confirmation_queue_base_len,
+            finalization_queue_base_len,
+        } = bundle_sandbox;
+        let sandbox_locker = SurfnetSvmLocker::new(sandbox_svm);
+
+        let blockhash = live_locker.latest_absolute_blockhash();
+        let build_transaction = |payer: &Keypair| {
+            let message = Message::new_with_blockhash(
+                &[system_instruction::transfer(
+                    &payer.pubkey(),
+                    &Pubkey::new_unique(),
+                    1_000_000,
+                )],
+                Some(&payer.pubkey()),
+                &blockhash,
+            );
+            VersionedTransaction::try_new(
+                VersionedMessage::Legacy(message),
+                &[payer.insecure_clone()],
+            )
+            .expect("transaction should sign")
+        };
+        let bundle_transaction = build_transaction(&bundle_payer);
+        let bundle_signature = bundle_transaction.signatures[0];
+        let live_transaction = build_transaction(&live_payer);
+        let live_signature = live_transaction.signatures[0];
+
+        let (sandbox_status_tx, _sandbox_status_rx) = unbounded();
+        sandbox_locker
+            .process_transaction(&None, bundle_transaction, sandbox_status_tx, true, true)
+            .await
+            .expect("bundle transaction should succeed in sandbox");
+
+        let (live_status_tx, _live_status_rx) = unbounded();
+        live_locker
+            .process_transaction(&None, live_transaction, live_status_tx, true, true)
+            .await
+            .expect("intervening live transaction should succeed");
+
+        let committed_bundle_index =
+            live_locker.with_svm_reader(|svm| svm.transactions_queued_for_confirmation.len());
+        let sandbox_svm = match Arc::try_unwrap(sandbox_locker.0) {
+            Ok(rwlock) => rwlock.into_inner(),
+            Err(_) => panic!("sandbox locker should have one owner"),
+        };
+        let reassembled = BundleSandbox {
+            svm: sandbox_svm,
+            geyser_rx: sandbox_geyser_rx,
+            simnet_rx: sandbox_simnet_rx,
+            confirmation_queue_base_len,
+            finalization_queue_base_len,
+        };
+        let (bundle_status_tx, _bundle_status_rx) = unbounded();
+        live_locker
+            .with_svm_writer(move |svm| svm.commit_sandbox(reassembled, bundle_status_tx))
+            .expect("bundle commit should succeed");
+
+        let queued_signatures = live_locker.with_svm_reader(|svm| {
+            svm.transactions_queued_for_confirmation
+                .iter()
+                .map(|(transaction, _, _)| transaction.signatures[0])
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(queued_signatures.len(), committed_bundle_index + 1);
+        assert_eq!(
+            &queued_signatures[committed_bundle_index - 1..],
+            &[live_signature, bundle_signature]
+        );
+
+        let mut notification_indices = HashMap::new();
+        for _ in 0..64 {
+            match geyser_rx.recv_timeout(Duration::from_millis(50)) {
+                Ok(crate::surfnet::GeyserEvent::NotifyTransaction(transaction, _, index)) => {
+                    let signature = transaction.transaction.signatures[0];
+                    if signature == live_signature || signature == bundle_signature {
+                        notification_indices.insert(signature, index);
+                    }
+                    if notification_indices.len() == 2 {
+                        break;
+                    }
+                }
+                Ok(_) => {}
+                Err(RecvTimeoutError::Timeout) | Err(RecvTimeoutError::Disconnected) => break,
+            }
+        }
+
+        assert_eq!(
+            notification_indices.get(&live_signature),
+            Some(&(committed_bundle_index - 1))
+        );
+        assert_eq!(
+            notification_indices.get(&bundle_signature),
+            Some(&committed_bundle_index)
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_transaction_fee_includes_priority_fee() {
         use crossbeam_channel::unbounded;
         use solana_compute_budget_interface::ComputeBudgetInstruction;

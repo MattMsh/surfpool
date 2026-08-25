@@ -319,6 +319,8 @@ impl Jito for SurfpoolJitoRpc {
                 svm: sandbox_svm,
                 geyser_rx,
                 simnet_rx,
+                confirmation_queue_base_len,
+                finalization_queue_base_len,
             } = bundle_sandbox;
 
             let sandbox_locker = SurfnetSvmLocker::new(sandbox_svm);
@@ -408,6 +410,8 @@ impl Jito for SurfpoolJitoRpc {
                 svm: sandbox_svm,
                 geyser_rx,
                 simnet_rx,
+                confirmation_queue_base_len,
+                finalization_queue_base_len,
             };
 
             // Use a discardable status channel for the bundle. The runloop will use it to
@@ -708,6 +712,7 @@ impl Jito for SurfpoolJitoRpc {
                 svm: sandbox_svm,
                 geyser_rx: _geyser_rx, // discarded on drop
                 simnet_rx: _simnet_rx, // discarded on drop
+                ..
             } = bundle_sandbox;
             let sandbox_locker = SurfnetSvmLocker::new(sandbox_svm);
 

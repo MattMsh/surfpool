@@ -431,6 +431,8 @@ pub struct BundleSandbox {
     pub svm: SurfnetSvm,
     pub geyser_rx: Receiver<GeyserEvent>,
     pub simnet_rx: Receiver<SimnetEvent>,
+    pub confirmation_queue_base_len: usize,
+    pub finalization_queue_base_len: usize,
 }
 
 /// Generic helper: drain the overlay state of `sandbox_storage` (which must be an
@@ -665,6 +667,8 @@ impl SurfnetSvm {
     /// buffered event, every overlay write, and the cloned `LiteSVM` state — the original
     /// VM is left byte-identical to its pre-bundle state.
     pub fn clone_for_bundle_sandbox(&self) -> BundleSandbox {
+        let confirmation_queue_base_len = self.transactions_queued_for_confirmation.len();
+        let finalization_queue_base_len = self.transactions_queued_for_finalization.len();
         let mut svm = self.clone_for_profiling();
         let (geyser_tx, geyser_rx) = crossbeam_channel::unbounded();
         let (simnet_tx, simnet_rx) = SimnetEventsTx::unbounded();
@@ -674,6 +678,8 @@ impl SurfnetSvm {
             svm,
             geyser_rx,
             simnet_rx,
+            confirmation_queue_base_len,
+            finalization_queue_base_len,
         }
     }
 
@@ -693,9 +699,10 @@ impl SurfnetSvm {
     ///   3. Drain the sandbox's account-DB overlay (`inner.db`) onto `self.inner.db` so any
     ///      SQLite-backed account persistence reflects the bundle's mutations.
     ///   4. Pull forward counters (`write_version`, `transactions_processed`), per-account
-    ///      update slots, pending confirmation/finalization queues, perf samples, and the
-    ///      recent-blockhash deque from the sandbox.
-    ///   5. Drain the sandbox's buffered geyser events; replay each onto `self.geyser_events_tx`.
+    ///      update slots, perf samples, and the recent-blockhash deque from the sandbox. Append
+    ///      only the bundle's confirmation/finalization queue delta to the live queues.
+    ///   5. Drain the sandbox's buffered geyser events; rebase transaction indices against the
+    ///      live confirmation queue at commit time and replay each onto `self.geyser_events_tx`.
     ///      For each `UpdateAccount` event, also fire `notify_account_subscribers` /
     ///      `notify_program_subscribers` on `self` (the sandbox's registries were emptied,
     ///      so those notifications could not have been delivered during sandbox execution).
@@ -717,6 +724,8 @@ impl SurfnetSvm {
             mut svm,
             geyser_rx,
             simnet_rx,
+            confirmation_queue_base_len,
+            finalization_queue_base_len,
         } = sandbox;
 
         // 1. Drain all overlay storages onto self's real storages.
@@ -786,11 +795,15 @@ impl SurfnetSvm {
         self.perf_samples = svm.perf_samples.clone();
         self.recent_blockhashes = svm.recent_blockhashes.clone();
 
-        // Push sandbox's queued txs onto self's queues, rewriting the per-tx status channel
-        // to the bundle's status channel so the runloop's Confirmed/Finalized promotions
-        // flow through a single channel (the caller drops the receiver).
+        // Append only the queue entries created by the bundle. The sandbox cloned the live
+        // queue at fork time, and that prefix may now be stale because live transactions can
+        // be committed while the bundle executes.
+        let committed_transaction_index_base = self.transactions_queued_for_confirmation.len();
         let mut signatures = Vec::new();
-        for (tx, _sandbox_status_tx, err) in svm.transactions_queued_for_confirmation.drain(..) {
+        for (tx, _sandbox_status_tx, err) in svm
+            .transactions_queued_for_confirmation
+            .drain(confirmation_queue_base_len..)
+        {
             signatures.push(tx.signatures[0]);
             self.transactions_queued_for_confirmation.push_back((
                 tx,
@@ -798,8 +811,9 @@ impl SurfnetSvm {
                 err,
             ));
         }
-        for (slot, tx, _sandbox_status_tx, err) in
-            svm.transactions_queued_for_finalization.drain(..)
+        for (slot, tx, _sandbox_status_tx, err) in svm
+            .transactions_queued_for_finalization
+            .drain(finalization_queue_base_len..)
         {
             self.transactions_queued_for_finalization.push_back((
                 slot,
@@ -811,10 +825,18 @@ impl SurfnetSvm {
 
         // 5. Drain buffered geyser events; replay onto self's real channel; for each
         //    UpdateAccount, also fire account/program subscribers on self's registries.
-        while let Ok(event) = geyser_rx.try_recv() {
-            if let GeyserEvent::UpdateAccount(update) = &event {
-                self.notify_account_subscribers(&update.pubkey, &update.account);
-                self.notify_program_subscribers(&update.pubkey, &update.account);
+        let mut next_transaction_index = committed_transaction_index_base;
+        while let Ok(mut event) = geyser_rx.try_recv() {
+            match &mut event {
+                GeyserEvent::NotifyTransaction(_, _, transaction_index) => {
+                    *transaction_index = next_transaction_index;
+                    next_transaction_index += 1;
+                }
+                GeyserEvent::UpdateAccount(update) => {
+                    self.notify_account_subscribers(&update.pubkey, &update.account);
+                    self.notify_program_subscribers(&update.pubkey, &update.account);
+                }
+                _ => {}
             }
             let _ = self.geyser_events_tx.send(event);
         }
