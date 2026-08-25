@@ -687,8 +687,8 @@ impl SurfnetSvm {
     ///
     /// This is the second half of the atomic Jito bundle pipeline. It must be invoked only
     /// after every transaction in the bundle succeeded inside the sandbox. The caller must
-    /// hold an exclusive writer guard on `self`'s `SurfnetSvmLocker` so that no other RPC
-    /// path can observe a half-committed state.
+    /// retain the same exclusive writer guard on `self`'s `SurfnetSvmLocker` from sandbox
+    /// creation through this commit so no live state can diverge from the sandbox base.
     ///
     /// Order of operations is **state mutations first, side-effects second**:
     ///   1. Drain every overlay-wrapped storage field from the sandbox onto `self`'s
@@ -727,6 +727,19 @@ impl SurfnetSvm {
             confirmation_queue_base_len,
             finalization_queue_base_len,
         } = sandbox;
+
+        let sandbox_slot = svm.get_latest_absolute_slot();
+        let live_slot = self.get_latest_absolute_slot();
+        if sandbox_slot != live_slot {
+            warn!(
+                "Rejecting stale bundle sandbox: sandbox_slot={}, live_slot={}",
+                sandbox_slot, live_slot
+            );
+            return Err(SurfpoolError::stale_bundle_sandbox_slot(
+                sandbox_slot,
+                live_slot,
+            ));
+        }
 
         // 1. Drain all overlay storages onto self's real storages.
         commit_overlay_storage(svm.blocks.as_ref(), self.blocks.as_mut())?;
@@ -4258,6 +4271,64 @@ mod tests {
                 .is_err()
         );
         assert!(!startup.has_changed().unwrap());
+    }
+
+    #[test]
+    fn bundle_commit_rejects_sandbox_from_previous_slot_before_side_effects() {
+        let (mut live_svm, _events_rx, live_geyser_rx) = SurfnetSvm::default();
+        let recipient = Pubkey::new_unique();
+        let mut sandbox = live_svm.clone_for_bundle_sandbox();
+
+        let sandbox_slot = sandbox.svm.get_latest_absolute_slot();
+        let _ = sandbox
+            .svm
+            .airdrop(&recipient, 1_000_000)
+            .expect("sandbox airdrop should succeed");
+
+        live_svm
+            .confirm_current_block()
+            .expect("live slot should advance");
+        let live_slot = live_svm.get_latest_absolute_slot();
+        assert_eq!(live_slot, sandbox_slot + 1);
+
+        let expected_chain_tip = live_svm.chain_tip.clone();
+        let expected_transactions_processed = live_svm.transactions_processed;
+        let expected_write_version = live_svm.write_version;
+        let expected_confirmation_queue_len = live_svm.transactions_queued_for_confirmation.len();
+        let (bundle_status_tx, _bundle_status_rx) = unbounded();
+
+        let error = live_svm
+            .commit_sandbox(sandbox, bundle_status_tx)
+            .expect_err("a sandbox from a closed slot must not commit");
+
+        assert!(error.to_string().contains(&format!(
+            "Bundle sandbox executed at slot {sandbox_slot}, but the live Surfnet advanced to slot {live_slot} before commit"
+        )));
+        assert_eq!(live_svm.get_latest_absolute_slot(), live_slot);
+        assert_eq!(live_svm.chain_tip, expected_chain_tip);
+        assert_eq!(
+            live_svm.transactions_processed,
+            expected_transactions_processed
+        );
+        assert_eq!(live_svm.write_version, expected_write_version);
+        assert_eq!(
+            live_svm.transactions_queued_for_confirmation.len(),
+            expected_confirmation_queue_len
+        );
+        assert!(
+            live_svm
+                .get_account(&recipient)
+                .expect("live account lookup should succeed")
+                .is_none(),
+            "stale sandbox account state must not reach the live SVM"
+        );
+        assert!(
+            live_geyser_rx.try_iter().all(|event| !matches!(
+                event,
+                GeyserEvent::UpdateAccount(update) if update.pubkey == recipient
+            )),
+            "stale sandbox events must not reach the live Geyser channel"
+        );
     }
 
     fn build_transfer_transaction(

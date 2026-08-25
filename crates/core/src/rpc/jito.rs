@@ -308,12 +308,12 @@ impl Jito for SurfpoolJitoRpc {
             }
 
             // -- Phase A: Sandbox execution -------------------------------------------------
-            // Take a brief read lock on the original VM to construct a sandbox whose storages
-            // are overlay-wrapped, whose subscription registries are empty (no live WS leak),
-            // and whose event channels buffer into receivers we hold here.
-            let bundle_sandbox = ctx
-                .svm_locker
-                .with_svm_reader(|svm_reader| svm_reader.clone_for_bundle_sandbox());
+            // Keep the original VM exclusively locked from sandbox creation through commit.
+            // The sandbox owns independent state, so processing below never re-enters this
+            // lock. This prevents clock ticks and RPC transactions from invalidating the
+            // sandbox's slot or account-state snapshot before the atomic commit.
+            let mut original_svm = ctx.svm_locker.0.write().await;
+            let bundle_sandbox = original_svm.clone_for_bundle_sandbox();
 
             let BundleSandbox {
                 svm: sandbox_svm,
@@ -397,7 +397,8 @@ impl Jito for SurfpoolJitoRpc {
             // -- Phase B: Atomic commit -----------------------------------------------------
             // All bundle transactions succeeded on the sandbox. Extract the sandbox SVM (the
             // only remaining Arc reference is the local `sandbox_locker`), reassemble the
-            // BundleSandbox and call commit_sandbox under the original VM's writer lock.
+            // BundleSandbox and commit it while retaining the writer guard acquired before
+            // sandbox creation.
             let sandbox_svm = match Arc::try_unwrap(sandbox_locker.0) {
                 Ok(rwlock) => rwlock.into_inner(),
                 Err(_) => {
@@ -419,15 +420,14 @@ impl Jito for SurfpoolJitoRpc {
             // silently.
             let (bundle_status_tx, _bundle_status_rx) = crossbeam_channel::unbounded();
 
-            ctx.svm_locker
-                .with_svm_writer(move |original| {
-                    original.commit_sandbox(reassembled, bundle_status_tx)
-                })
+            original_svm
+                .commit_sandbox(reassembled, bundle_status_tx)
                 .map_err(|e| {
                     Error::invalid_params(format!(
                         "Jito bundle commit failed after successful sandbox execution: {e}"
                     ))
                 })?;
+            drop(original_svm);
 
             // Calculate bundle ID by hashing comma-separated signatures (Jito-compatible)
             // https://github.com/jito-foundation/jito-solana/blob/master/sdk/src/bundle/mod.rs#L21

@@ -84,6 +84,14 @@ impl From<solana_client::client_error::ClientError> for SurfpoolError {
 }
 
 impl SurfpoolError {
+    pub fn stale_bundle_sandbox_slot(sandbox_slot: Slot, live_slot: Slot) -> Self {
+        let mut error = Error::invalid_request();
+        error.data = Some(json!(format!(
+            "Bundle sandbox executed at slot {sandbox_slot}, but the live Surfnet advanced to slot {live_slot} before commit"
+        )));
+        Self(error)
+    }
+
     pub fn from_try_send_error<T>(e: TrySendError<T>) -> Self {
         let mut error = Error::internal_error();
         error.data = Some(json!(format!(
