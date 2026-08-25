@@ -79,7 +79,11 @@ pub struct GeyserEntryInfo {
 
 #[allow(clippy::large_enum_variant)]
 pub enum GeyserEvent {
-    NotifyTransaction(TransactionWithStatusMeta, Option<VersionedTransaction>),
+    NotifyTransaction(
+        TransactionWithStatusMeta,
+        Option<VersionedTransaction>,
+        usize,
+    ),
     UpdateAccount(GeyserAccountUpdate),
     /// Account update sent at startup (before block production begins).
     /// These updates should be sent to geyser plugins with is_startup=true.

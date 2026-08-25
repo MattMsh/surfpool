@@ -2234,6 +2234,7 @@ impl SurfnetSvmLocker {
             )));
 
             self.with_svm_writer(|svm_writer| {
+                let transaction_index = svm_writer.transactions_queued_for_confirmation.len();
                 let transaction_with_status_meta = TransactionWithStatusMeta::from_failure(
                     simulated_slot,
                     transaction.clone(),
@@ -2261,6 +2262,7 @@ impl SurfnetSvmLocker {
                     .send(GeyserEvent::NotifyTransaction(
                         transaction_with_status_meta,
                         Some(transaction.clone()),
+                        transaction_index,
                     ));
 
                 svm_writer.transactions_queued_for_confirmation.push_back((
@@ -2423,6 +2425,7 @@ impl SurfnetSvmLocker {
                 .collect::<Result<Vec<_>, SurfpoolError>>()?;
 
             if do_propagate {
+                let transaction_index = svm_writer.transactions_queued_for_confirmation.len();
                 let transaction_meta =
                     convert_transaction_metadata_from_canonical(&transaction_metadata);
                 let transaction_with_status_meta = TransactionWithStatusMeta::new(
@@ -2455,6 +2458,7 @@ impl SurfnetSvmLocker {
                     .send(GeyserEvent::NotifyTransaction(
                         transaction_with_status_meta,
                         versioned_transaction,
+                        transaction_index,
                     ));
 
                 svm_writer.transactions_queued_for_confirmation.push_back((
@@ -5545,7 +5549,7 @@ mod tests {
                 Ok(crate::surfnet::GeyserEvent::UpdateAccount(update)) => {
                     account_updates.push(update);
                 }
-                Ok(crate::surfnet::GeyserEvent::NotifyTransaction(_, _)) => {
+                Ok(crate::surfnet::GeyserEvent::NotifyTransaction(_, _, _)) => {
                     got_transaction_notify = true;
                 }
                 Ok(_) => {}
@@ -5580,6 +5584,82 @@ mod tests {
                 "Account update should carry transaction signature"
             );
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn same_slot_transactions_emit_ordered_geyser_indices() {
+        use std::time::Duration;
+
+        use crossbeam_channel::{RecvTimeoutError, unbounded};
+        use solana_keypair::Keypair;
+        use solana_message::{Message, VersionedMessage};
+        use solana_signer::Signer;
+        use solana_system_interface::instruction as system_instruction;
+        use solana_transaction::versioned::VersionedTransaction;
+
+        let (svm, _events_rx, geyser_rx) = SurfnetSvm::default();
+        let locker = SurfnetSvmLocker::new(svm);
+        let payer = Keypair::new();
+        let payer_pubkey = payer.pubkey();
+
+        let _ = locker
+            .airdrop(&payer_pubkey, 1_000_000_000)
+            .expect("airdrop should succeed");
+
+        let first_transaction_index =
+            locker.with_svm_reader(|svm| svm.transactions_queued_for_confirmation.len());
+        let blockhash = locker.latest_absolute_blockhash();
+        let mut expected_signatures = Vec::new();
+
+        for amount in [1_000_000, 2_000_000_000] {
+            let message = Message::new_with_blockhash(
+                &[system_instruction::transfer(
+                    &payer_pubkey,
+                    &Pubkey::new_unique(),
+                    amount,
+                )],
+                Some(&payer_pubkey),
+                &blockhash,
+            );
+            let transaction = VersionedTransaction::try_new(
+                VersionedMessage::Legacy(message),
+                &[payer.insecure_clone()],
+            )
+            .expect("transaction should sign");
+            expected_signatures.push(transaction.signatures[0]);
+
+            let (status_tx, _status_rx) = unbounded();
+            locker
+                .process_transaction(&None, transaction, status_tx, true, true)
+                .await
+                .expect("transaction processing should succeed");
+        }
+
+        let mut notifications = Vec::new();
+        for _ in 0..64 {
+            match geyser_rx.recv_timeout(Duration::from_millis(50)) {
+                Ok(crate::surfnet::GeyserEvent::NotifyTransaction(transaction, _, index)) => {
+                    notifications.push((
+                        transaction.transaction.signatures[0],
+                        index,
+                        transaction.meta.status.is_ok(),
+                    ));
+                    if notifications.len() == expected_signatures.len() {
+                        break;
+                    }
+                }
+                Ok(_) => {}
+                Err(RecvTimeoutError::Timeout) | Err(RecvTimeoutError::Disconnected) => break,
+            }
+        }
+
+        assert_eq!(
+            notifications,
+            vec![
+                (expected_signatures[0], first_transaction_index, true),
+                (expected_signatures[1], first_transaction_index + 1, false),
+            ]
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

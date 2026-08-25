@@ -734,7 +734,7 @@ fn start_geyser_runloop(
                     Err(e) => {
                         break format!("Failed to read new transaction to send to Geyser plugin: {e}");
                     },
-                    Ok(GeyserEvent::NotifyTransaction(transaction_with_status_meta, versioned_transaction)) => {
+                    Ok(GeyserEvent::NotifyTransaction(transaction_with_status_meta, versioned_transaction, transaction_index)) => {
 
                         if !indexing_enabled {
                             continue;
@@ -753,7 +753,7 @@ fn start_geyser_runloop(
                             is_vote: false,
                             transaction: &transaction,
                             transaction_status_meta: &transaction_with_status_meta.meta,
-                            index: 0,
+                            index: transaction_index,
                             message_hash: &transaction.message.hash(),
                         };
 
